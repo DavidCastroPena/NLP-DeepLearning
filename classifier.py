@@ -70,19 +70,17 @@ class GPT2SentimentClassifier(torch.nn.Module):
     """
     outputs = self.gpt(input_ids, attention_mask=attention_mask)
     hidden_states = outputs['last_hidden_state']
-    # Extract last token's hidden state (assuming padding is on the left)
-    #last_token_index = attention_mask.sum(dim=1) - 1  # Find last non-padding token index
-    #last_hidden_state = hidden_states[torch.arange(hidden_states.size(0)), last_token_index]
-    
-    hidden_states = outputs['last_hidden_state']  # Shape: [batch_size, seq_length, hidden_dim]
-    
-    # Extract last token's hidden state for each sequence in the batch
-    last_token_index = attention_mask.sum(dim=1) - 1  # Find last non-padding token index
+
+    # Get the last hidden state, it has the most comprehensive information about the input sequence
+    last_token_index = attention_mask.sum(dim=1) - 1 
     last_hidden_state = hidden_states[torch.arange(hidden_states.size(0)), last_token_index]
-    
-    # Pass through classifier
+
+    # Apply dropout
+    last_hidden_state = self.dropout(last_hidden_state)
+
     logits = self.classifier(last_hidden_state)
     return logits
+    
 
 class SentimentDataset(Dataset):
   def __init__(self, dataset, args):

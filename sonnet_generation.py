@@ -53,6 +53,9 @@ class SonnetGPT(nn.Module):
     # By default, fine-tune the full model. TODO: this is maybe not idea.
     for param in self.gpt.parameters():
       param.requires_grad = True
+    
+    # Linear layer to map hidden states to vocab
+    self.language_modeling_head = nn.Linear(args.d, self.tokenizer.vocab_size, bias=False)
 
   def forward(self, input_ids, attention_mask):
     """
@@ -60,8 +63,10 @@ class SonnetGPT(nn.Module):
     not just the last token! This will allow our model to learn the natural language distribution that composes sonnets,
     not just the distribution over next tokens for the last token!
     """
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    outputs = self.gpt(input_ids, attention_mask=attention_mask)
+    hidden_states = outputs['last_hidden_state']
+    logits = self.language_modeling_head(hidden_states)
+    return logits
 
 
   def get_device(self):
@@ -69,7 +74,7 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128, num_beams=5):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -79,7 +84,6 @@ class SonnetGPT(nn.Module):
     """
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
-
 
     for _ in range(max_length):
       # Forward pass to get logits
@@ -262,7 +266,7 @@ def add_arguments(args):
 
 if __name__ == "__main__":
   args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
+  args.filepath = f'predictions/{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
   train(args)
   generate_submission_sonnets(args)

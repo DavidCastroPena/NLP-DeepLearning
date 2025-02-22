@@ -72,8 +72,15 @@ class ParaphraseGPT(nn.Module):
 
     'Takes a batch of sentences and produces embeddings for them.'
     ### YOUR CODE HERE
-    raise NotImplementedError
+    outputs = self.gpt(input_ids, attention_mask=attention_mask)
+    hidden_states = outputs['last_hidden_state']
 
+    # Get last hidden state
+    last_token_index = attention_mask.sum(dim=1) - 1 
+    last_hidden_state = hidden_states[torch.arange(hidden_states.size(0)), last_token_index]
+  
+    logits = self.paraphrase_detection_head(last_hidden_state)
+    return logits
 
 
 def save_model(model, optimizer, args, filepath):
@@ -129,7 +136,13 @@ def train(args):
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
       preds = torch.argmax(logits, dim=1)
+
+      # Update labels from byte pair encoding into 0 or 1
+      labels = torch.where(labels == 8505, torch.tensor(1), torch.tensor(0))
+      labels = labels.to(device)
+
       loss = F.cross_entropy(logits, labels, reduction='mean')
+
       loss.backward()
       optimizer.step()
 

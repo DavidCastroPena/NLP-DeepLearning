@@ -49,16 +49,13 @@ class GPT2Model(GPTPreTrainedModel):
 
       # Get token embeddings
       inputs_embeds = self.word_embedding(input_ids)
-      print("\n🔹 Token Embeddings Shape:", inputs_embeds.shape)
 
       # Get positional embeddings
       pos_ids = self.position_ids[:, :seq_length]
       pos_embeds = self.pos_embedding(pos_ids)
-      print("\n🔹 Position Embeddings Shape:", pos_embeds.shape)
 
       # Add embeddings and apply dropout
       embeddings = self.embed_dropout(inputs_embeds + pos_embeds)
-      print("\n🔹 Final Embeddings Shape:", embeddings.shape)
 
       return embeddings  
 
@@ -81,7 +78,6 @@ class GPT2Model(GPTPreTrainedModel):
     for i, layer_module in enumerate(self.gpt_layers):
       # Feed the encoding from the last bert_layer to the next.
       hidden_states = layer_module(hidden_states, extended_attention_mask)
-      print("\n🔹 Extended Attention Mask Shape:", extended_attention_mask.shape)
 
     return hidden_states
 
