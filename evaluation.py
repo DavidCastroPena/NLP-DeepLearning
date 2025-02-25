@@ -59,6 +59,9 @@ def model_test_paraphrase(dataloader, model, device):
     logits = model(b_ids, b_mask).cpu().numpy()
     preds = np.argmax(logits, axis=1).flatten()
 
+    # Update output to bp format, 0 to 3919, 1 to 8505.
+    preds = np.where(preds == 0, 3919, 8505)
+
     y_pred.extend(preds)
     sent_ids.extend(b_sent_ids)
 
