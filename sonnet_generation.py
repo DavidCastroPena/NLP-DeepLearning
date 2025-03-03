@@ -27,6 +27,8 @@ from models.gpt2 import GPT2Model
 
 from optimizer import AdamW
 
+from evaluation import test_sonnet
+
 TQDM_DISABLE = False
 
 
@@ -47,7 +49,7 @@ class SonnetGPT(nn.Module):
   def __init__(self, args):
     super().__init__()
     self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
-    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2', pad_token='<|endoftext|>')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
     # By default, fine-tune the full model. TODO: this is maybe not idea.
@@ -85,15 +87,13 @@ class SonnetGPT(nn.Module):
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
 
-    for _ in range(max_length):
-      # Forward pass to get logits
-      logits_sequence = self.forward(token_ids, attention_mask)
-      logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+    ################################################################################################ 
+    ## Decoding methods begins
+    ################################################################################################
+    def greedy_search(probs):
+      return torch.argmax(probs, dim=-1, keepdim=True)
 
-      # Convert logits to probabilities
-      probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
-
-      # Top-p (nucleus) sampling
+    def top_p_sampling(probs, top_p=0.9):
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
       cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
       top_p_mask = cumulative_probs <= top_p
@@ -104,7 +104,65 @@ class SonnetGPT(nn.Module):
 
       # Sample from filtered distribution
       sampled_index = torch.multinomial(filtered_probs, 1)
-      sampled_token = sorted_indices.gather(dim=-1, index=sampled_index)
+      return sorted_indices.gather(dim=-1, index=sampled_index)
+    
+    def top_k_sampling(probs, k=50):
+      top_values, top_indices = torch.topk(probs, k)
+      top_values /= torch.sum(top_values)  # Normalize
+      sampled_index = torch.multinomial(top_values, 1)
+      return top_indices.gather(dim=-1, index=sampled_index)
+
+    def beam_search(logits_sequence, num_beams=5, max_length=10):
+      _, _, vocab_size = logits_sequence.shape
+      input_ids               = token_ids.expand(num_beams, -1)
+      attention_mask_expanded = attention_mask.expand(num_beams, -1)
+      beam_scores = torch.zeros(num_beams, device=self.get_device())
+
+      # Probe max_length times into the future to get the best beam.
+      for _ in range(max_length):
+        # probe
+        logits_sequence = self.forward(input_ids, attention_mask_expanded)
+        logits = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+        probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        # get new beam scores
+        scores = (beam_scores.unsqueeze(-1) + probs).view(-1)
+        top_scores, top_indices = torch.topk(scores, num_beams)
+        beam_scores = top_scores
+
+        # process top_indices
+        next_token_ids = top_indices % vocab_size
+        beam_indices = top_indices // vocab_size
+
+        # get new inputs and beam
+        input_ids = torch.cat([input_ids[beam_indices], next_token_ids.unsqueeze(-1)], dim=-1)
+        new_attention_tokens = torch.ones((num_beams, 1), dtype=torch.int64, device=self.get_device())
+        attention_mask_expanded = torch.cat([attention_mask_expanded[beam_indices], new_attention_tokens], dim=-1)
+
+        # stop if EOS
+        if (next_token_ids == self.tokenizer.eos_token_id).all():
+            break
+
+      # Choose best sequence
+      best_sequence_idx = beam_scores.argmax()
+      return input_ids[best_sequence_idx, -1].unsqueeze(0).unsqueeze(1)
+    
+    ################################################################################################
+    ## Decoding methods ends
+    ################################################################################################
+
+    for _ in range(max_length):
+      # Forward pass to get logits
+      logits_sequence = self.forward(token_ids, attention_mask)
+      logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+
+      # Convert logits to probabilities
+      probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
+
+      # sampled_token = greedy_search(probs)
+      # sampled_token = top_p_sampling(probs)
+      # sampled_token = top_k_sampling(probs)
+      sampled_token = beam_search(logits_sequence, num_beams)
 
       # Stop if end-of-sequence token is reached
       if sampled_token.item() == self.tokenizer.eos_token_id:
@@ -116,7 +174,7 @@ class SonnetGPT(nn.Module):
         [attention_mask, torch.ones((1, 1), dtype=torch.int64).to(self.get_device())], dim=1
       )
 
-    generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())[3:]
+    generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist(), skip_special_tokens=True)[3:]
     return token_ids, generated_output
 
 
@@ -180,10 +238,27 @@ def train(args):
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
     print('Generating several output sonnets...')
     model.eval()
+
+    generated_sonnets = []
     for batch in held_out_sonnet_dataset:
-      encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
-      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
-      print(f'{batch[1]}{output[1]}\n\n')
+      sonnet_id = batch[0]
+      encoding = model.tokenizer(batch[1], return_tensors='pt', padding=False, truncation=True).to(device)
+      
+      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)[0][0]
+      decoded_output = model.tokenizer.decode(output, skip_special_tokens=True)
+      full_sonnet = f'{decoded_output}\n\n'
+      
+      generated_sonnets.append((sonnet_id, full_sonnet))
+      print(f"{decoded_output}\n\n")
+
+    with open(args.sonnet_out, "w+") as f:
+      f.write(f"--Generated Sonnets-- \n\n")
+      for sonnet in generated_sonnets:
+        f.write(f"\n{sonnet[0]}\n")
+        f.write(sonnet[1])
+
+    chrf_score = test_sonnet(test_path=args.sonnet_out, gold_path=args.held_out_sonnet_path)
+    print(f"Epoch {epoch}: CHRF Score = {chrf_score:.3f}")
 
     # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
     save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
@@ -218,7 +293,10 @@ def generate_submission_sonnets(args):
     for sonnet in generated_sonnets:
       f.write(f"\n{sonnet[0]}\n")
       f.write(sonnet[1])
-
+  
+  # # Get CRHF score
+  # score = test_sonnet(test_path=args.sonnet_out, gold_path=args.held_out_sonnet_path)
+  # print(f"CHRF score for generated sonnets: {score:.3f}")
 
 def get_args():
   parser = argparse.ArgumentParser()
@@ -266,7 +344,7 @@ def add_arguments(args):
 
 if __name__ == "__main__":
   args = get_args()
-  args.filepath = f'predictions/{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
+  args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
   train(args)
   generate_submission_sonnets(args)

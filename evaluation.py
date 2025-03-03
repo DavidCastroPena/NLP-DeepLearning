@@ -84,3 +84,7 @@ def test_sonnet(
     # compute chrf
     chrf_score = chrf.corpus_score(generated_sonnets, [true_sonnets])
     return float(chrf_score.score)
+
+# if __name__ == "__main__":
+#     score = test_sonnet(test_path='predictions/generated_sonnets.txt', gold_path='data/sonnets_held_out.txt')
+#     print(f"CHRF score for generated sonnets: {score:.3f}")
