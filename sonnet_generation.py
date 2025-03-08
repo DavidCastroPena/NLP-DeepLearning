@@ -58,6 +58,7 @@ class SonnetGPT(nn.Module):
     
     # Linear layer to map hidden states to vocab
     self.language_modeling_head = nn.Linear(args.d, self.tokenizer.vocab_size, bias=False)
+    self.language_modeling_head.weight = self.gpt.word_embedding.weight
 
   def forward(self, input_ids, attention_mask):
     """
@@ -161,8 +162,8 @@ class SonnetGPT(nn.Module):
 
       # sampled_token = greedy_search(probs)
       # sampled_token = top_p_sampling(probs)
-      # sampled_token = top_k_sampling(probs)
-      sampled_token = beam_search(logits_sequence, num_beams)
+      sampled_token = top_k_sampling(probs)
+      # sampled_token = beam_search(logits_sequence, num_beams)
 
       # Stop if end-of-sequence token is reached
       if sampled_token.item() == self.tokenizer.eos_token_id:
@@ -210,6 +211,10 @@ def train(args):
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
 
+  patience = 3  # Stop if no improvement after 3 epochs.
+  best_loss = float('inf')
+  epochs_no_improve = 0
+
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
     model.train()
@@ -236,38 +241,33 @@ def train(args):
 
     train_loss = train_loss / num_batches
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
-    print('Generating several output sonnets...')
-    model.eval()
 
-    generated_sonnets = []
-    for batch in held_out_sonnet_dataset:
-      sonnet_id = batch[0]
-      encoding = model.tokenizer(batch[1], return_tensors='pt', padding=False, truncation=True).to(device)
-      
-      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)[0][0]
-      decoded_output = model.tokenizer.decode(output, skip_special_tokens=True)
-      full_sonnet = f'{decoded_output}\n\n'
-      
-      generated_sonnets.append((sonnet_id, full_sonnet))
-      print(f"{decoded_output}\n\n")
+    # print('Generating several output sonnets...')
+    # model.eval()
+    # for batch in held_out_sonnet_dataset:
+    #   encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
+    #   output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
+    #   print(f'{batch[1]}{output[1]}\n\n')
 
-    with open(args.sonnet_out, "w+") as f:
-      f.write(f"--Generated Sonnets-- \n\n")
-      for sonnet in generated_sonnets:
-        f.write(f"\n{sonnet[0]}\n")
-        f.write(sonnet[1])
+    # Early stopping to prevent overfitting on the small dataset of sonnets.
+    if train_loss < best_loss:
+        best_loss = train_loss
+        epochs_no_improve = 0
+    else:
+        epochs_no_improve += 1
 
-    chrf_score = test_sonnet(test_path=args.sonnet_out, gold_path=args.held_out_sonnet_path)
-    print(f"Epoch {epoch}: CHRF Score = {chrf_score:.3f}")
-
-    # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
-    save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+    if epochs_no_improve >= patience:
+        print(f"Stopping early at epoch {epoch}. No improvement for {patience} epochs.")
+        break
+    
+    # save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+  save_model(model, optimizer, args, f'final_{args.filepath}')
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  saved = torch.load(f'final_{args.filepath}', weights_only=False)
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -293,10 +293,6 @@ def generate_submission_sonnets(args):
     for sonnet in generated_sonnets:
       f.write(f"\n{sonnet[0]}\n")
       f.write(sonnet[1])
-  
-  # # Get CRHF score
-  # score = test_sonnet(test_path=args.sonnet_out, gold_path=args.held_out_sonnet_path)
-  # print(f"CHRF score for generated sonnets: {score:.3f}")
 
 def get_args():
   parser = argparse.ArgumentParser()
