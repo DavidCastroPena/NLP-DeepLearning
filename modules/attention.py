@@ -73,21 +73,30 @@ from einops import rearrange
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.num_attention_heads = config.num_attention_heads
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+
+        # Use getattr with default values for safety
+        max_pos_emb = getattr(config, "max_position_embeddings", 512)
+        num_heads = getattr(config, "num_attention_heads", 12)
+        hidden_size = getattr(config, "hidden_size", 768)
+        dropout_prob = getattr(config, "attention_probs_dropout_prob", 0.1)
+        
+        # Print which values we're using for debugging
+        print(f"Using max_position_embeddings: {max_pos_emb}")
+        
+        self.num_attention_heads = num_heads
+        self.attention_head_size = int(hidden_size / num_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
         # Initialize the linear transformation layers for key, value, query
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.query = nn.Linear(hidden_size, self.all_head_size)
+        self.key = nn.Linear(hidden_size, self.all_head_size)
+        self.value = nn.Linear(hidden_size, self.all_head_size)
 
         # Dropout for attention weights
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
-
+        self.dropout = nn.Dropout(dropout_prob)
+        
         # Register causal mask buffer
-        mask = torch.triu(torch.ones(config.max_position_embeddings, 
-                                   config.max_position_embeddings), diagonal=1).bool()
+        mask = torch.triu(torch.ones(max_pos_emb, max_pos_emb), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
 
     def transform(self, x, linear_layer):
@@ -98,15 +107,15 @@ class CausalSelfAttention(nn.Module):
 
     def attention(self, key, query, value, attention_mask):
         batch_size, seq_length = query.shape[0], query.shape[2]
-        
+
         # Compute attention scores
         attention_scores = torch.matmul(query, key.transpose(-2, -1))
         attention_scores = attention_scores * (self.attention_head_size ** -0.5)
-        
+
         # Apply causal mask
         causal_mask = self.causal_mask[:seq_length, :seq_length]
         attention_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-        
+
         # Apply padding mask if provided
         if attention_mask is not None:
             attention_scores = attention_scores + attention_mask
