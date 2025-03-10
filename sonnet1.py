@@ -27,20 +27,15 @@ from datasets import (
 from models.gpt2 import GPT2Model, GPT2ModelWithLMHead
 from config import GPT2Config
 from optimizer import AdamW
-from torch.utils.data import random_split
-
 
 # LoRA Configuration
 from peft import get_peft_model, LoraConfig, TaskType
-
 lora_config = LoraConfig(
   task_type=TaskType.CAUSAL_LM,  # Language modeling task
-  r=16,  # rank (the more rank, the more information captured from original matrix)
-  lora_alpha=32,  # scaling (the larger the scale, the greater adaptation strength)
+  r=8,  # LoRA rank (low-rank adaptation)
+  lora_alpha=16,  # Scaling factor
   lora_dropout=0.1,  # Dropout for LoRA layers
-  target_modules = [f"gpt_layers.{i}.self_attention.query" for i in range(12)] + 
-                   [f"gpt_layers.{i}.self_attention.key" for i in range(12)] + 
-                   [f"gpt_layers.{i}.self_attention.value" for i in range(12)],
+  target_modules=["self_attention.query", "self_attention.key", "self_attention.value"], 
 )
 
 TQDM_DISABLE = False
@@ -68,42 +63,43 @@ class SonnetGPT(nn.Module):
     super().__init__()
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2', pad_token='<|endoftext|>')
     self.tokenizer.pad_token = self.tokenizer.eos_token
-
+    
     self.gpt = GPT2ModelWithLMHead.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
     self.gpt.config = GPT2Config(hidden_size=args.d, num_hidden_layers=args.l, num_attention_heads=args.num_heads)
 
-    self.use_lora = args.use_lora
-
-    if self.use_lora:
-      print("Use LORA!!!")
-      self.gpt = get_peft_model(self.gpt, lora_config)
-      self.gpt.print_trainable_parameters()
-
-    else:
-      # self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
-      # By default, fine-tune the full model. TODO: this is maybe not idea.
-      for param in self.gpt.parameters():
-        param.requires_grad = True
+    # Apply LoRA
+    self.gpt = get_peft_model(self.gpt, lora_config)
+    self.gpt.print_trainable_parameters()
     
+    # for name, module in self.gpt.named_modules():
+    #   if isinstance(module, LoRALinear):
+    #       print(f"✅ LoRA applied to: {name} -> {module}")
+    # count_parameters(self.gpt)
+    # print(self.gpt)  # Ensure LoRA layers are part of the model
+    
+    # # Linear layer to map hidden states to vocab
+    # self.language_modeling_head = nn.Linear(args.d, self.tokenizer.vocab_size, bias=False)
+    # self.language_modeling_head.weight = self.gpt.word_embedding.weight
+
   def forward(self, input_ids, attention_mask):
     """
     This is similar to the forward for ParaphraseGPT, but we now want to produce a logit for each token in our sequence;
     not just the last token! This will allow our model to learn the natural language distribution that composes sonnets,
     not just the distribution over next tokens for the last token!
     """
-    # if self.use_lora:
-    #   outputs = self.gpt.base_model(input_ids=input_ids, attention_mask=attention_mask)
-    #   return outputs["logits"]
-
-    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    outputs = self.gpt.base_model(input_ids=input_ids, attention_mask=attention_mask)
+    # outputs = self.gpt(input_ids, attention_mask=attention_mask)
+    # hidden_states = outputs['last_hidden_state']
+    # logits = self.language_modeling_head(hidden_states)
     return outputs["logits"]
+
 
   def get_device(self):
     for param in self.gpt.parameters():
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, decoding_method="top_k_p", temperature=0.7, top_p=0.9, top_k=50, max_length=128, num_beams=5):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128, num_beams=5):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -111,6 +107,9 @@ class SonnetGPT(nn.Module):
     In particular, generating multiple sequences and choosing the best with beam search is one avenue. Top_k is another;
     there are many.
     """
+    token_ids = encoding.to(self.get_device())
+    attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
+
     ################################################################################################ 
     ## Decoding methods begins
     ################################################################################################
@@ -135,30 +134,8 @@ class SonnetGPT(nn.Module):
       top_values /= torch.sum(top_values)  # Normalize
       sampled_index = torch.multinomial(top_values, 1)
       return top_indices.gather(dim=-1, index=sampled_index)
-    
-    def top_k_p_sampling(probs, k=50, p=0.9):
-      sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-      cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-      # Top p mask
-      top_p_mask = cumulative_probs <= top_p
-      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding
-      top_p_mask[..., 0] = True  # Always include the highest probability token
-
-      # Top k mask
-      top_k_mask = torch.zeros_like(probs, dtype=torch.bool)
-      top_k_mask[..., :top_k] = True
-
-      # Combined mask
-      combined_mask = top_p_mask & top_k_mask
-      filtered_probs = sorted_probs * combined_mask  # Zero out unlikely tokens
-      filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
-
-      # Sample from filtered distribution
-      sampled_index = torch.multinomial(filtered_probs, 1)
-      return sorted_indices.gather(dim=-1, index=sampled_index)
-
-    def beam_search(logits_sequence, num_beams=5, max_length=20):
+    def beam_search(logits_sequence, num_beams=5, max_length=10):
       _, _, vocab_size = logits_sequence.shape
       input_ids               = token_ids.expand(num_beams, -1)
       attention_mask_expanded = attention_mask.expand(num_beams, -1)
@@ -196,18 +173,6 @@ class SonnetGPT(nn.Module):
     ################################################################################################
     ## Decoding methods ends
     ################################################################################################
-    token_ids = encoding.to(self.get_device())
-    attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
-
-    decoding_strategies = {
-        "greedy": greedy_search,
-        "top_p": lambda probs: top_p_sampling(probs, top_p),
-        "top_k": lambda probs: top_k_sampling(probs, top_k),
-        "top_k_p": lambda probs: top_k_p_sampling(probs, top_k, top_p),
-        "beam_search": lambda logits_seq: beam_search(logits_seq, num_beams)
-    }
-    if decoding_method not in decoding_strategies:
-      raise ValueError(f"Invalid decoding method '{decoding_method}'. Choose from {list(decoding_strategies.keys())}.")
 
     for _ in range(max_length):
       # Forward pass to get logits
@@ -217,14 +182,9 @@ class SonnetGPT(nn.Module):
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
 
-      if decoding_method == "beam_search":
-          sampled_token = decoding_strategies[decoding_method](logits_sequence)
-      else:
-          sampled_token = decoding_strategies[decoding_method](probs)
       # sampled_token = greedy_search(probs)
       # sampled_token = top_p_sampling(probs)
-      # sampled_token = top_k_sampling(probs)
-      # sampled_token = top_k_p_sampling(probs, top_k, top_p)
+      sampled_token = top_k_sampling(probs)
       # sampled_token = beam_search(logits_sequence, num_beams)
 
       # Stop if end-of-sequence token is reached
@@ -254,45 +214,11 @@ def save_model(model, optimizer, args, filepath):
   torch.save(save_info, filepath)
   print(f"save the model to {filepath}")
 
-@torch.no_grad()
-def evaluate_perplexity(model, dataloader, device):
-    """Computes the perplexity of the model on the given dataloader."""
-    model.eval()
-    total_loss = 0
-    num_batches = 0
-
-    for batch in tqdm(dataloader, desc='Evaluating', disable=TQDM_DISABLE):
-        b_ids, b_mask = batch['token_ids'], batch['attention_mask']
-        b_ids = b_ids.to(device)
-        b_mask = b_mask.to(device)
-
-        logits = model(b_ids, b_mask)
-        logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')
-        labels = b_ids[:, 1:].contiguous().flatten()
-        loss = F.cross_entropy(logits, labels, reduction='mean')
-
-        total_loss += loss.item()
-        num_batches += 1
-
-    avg_loss = total_loss / num_batches
-    perplexity = torch.exp(torch.tensor(avg_loss)).item()
-    return avg_loss, perplexity
-
 
 def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-
-  # # Training + Validation data split.
-  # full_dataset = SonnetsDataset(args.sonnet_path)
-  # # Split into train and validation sets (80% train, 20% validation)
-  # train_size = int(0.8 * len(full_dataset))
-  # val_size = len(full_dataset) - train_size
-  # train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-
-  # train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size, collate_fn=full_dataset.collate_fn)
-  # val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=full_dataset.collate_fn)
-
+  # Create the data and its corresponding datasets and dataloader.
   sonnet_dataset = SonnetsDataset(args.sonnet_path)
   sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
                                  collate_fn=sonnet_dataset.collate_fn)
@@ -313,17 +239,15 @@ def train(args):
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
-
-    print("GPU allocated memory:", torch.cuda.memory_allocated() / 1e9, "GB")
-    print("GPU reserved memory:", torch.cuda.memory_reserved() / 1e9, "GB")
-
     model.train()
     train_loss = 0
     num_batches = 0
 
     for batch in tqdm(sonnet_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
       # Get the input and move it to the gpu (I do not recommend training this model on CPU).
-      b_ids, b_mask = batch['token_ids'].to(device), batch['attention_mask'].to(device)
+      b_ids, b_mask = batch['token_ids'], batch['attention_mask']
+      b_ids = b_ids.to(device)
+      b_mask = b_mask.to(device)
 
       # Compute the loss, gradients, and update the model's parameters.
       optimizer.zero_grad()
@@ -340,15 +264,12 @@ def train(args):
     train_loss = train_loss / num_batches
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
 
-    # val_loss, perplexity = evaluate_perplexity(model, val_dataloader, device)
-    # print(f"Epoch {epoch}: validation loss :: {val_loss :.3f}, perplexity :: {perplexity :.3f}.")
-
-    # print('Generating several output sonnets...')
-    # model.eval()
-    # for batch in held_out_sonnet_dataset:
-    #   encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
-    #   output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
-    #   print(f'{batch[1]}{output[1]}\n\n')
+    print('Generating several output sonnets...')
+    model.eval()
+    for batch in held_out_sonnet_dataset:
+      encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
+      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
+      print(f'{batch[1]}{output[1]}\n\n')
 
     # Early stopping to prevent overfitting on the small dataset of sonnets.
     if train_loss < best_loss:
@@ -367,7 +288,6 @@ def train(args):
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
-  print("Start to generate_submission_sonnets.")
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   saved = torch.load(f'final_{args.filepath}', weights_only=False)
 
@@ -383,7 +303,7 @@ def generate_submission_sonnets(args):
   for batch in held_out_sonnet_dataset:
     sonnet_id = batch[0]
     encoding = model.tokenizer(batch[1], return_tensors='pt', padding=False, truncation=True).to(device)
-    output = model.generate(encoding['input_ids'], args.decoding_method, temperature=args.temperature, top_p=args.top_p)[0][0]
+    output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)[0][0]
     decoded_output = model.tokenizer.decode(output)
     full_sonnet = f'{decoded_output}\n\n'
     generated_sonnets.append((sonnet_id, full_sonnet))
@@ -416,10 +336,6 @@ def get_args():
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
-  
-  parser.add_argument("--use_lora", type=bool, default=False)
-  parser.add_argument("--decoding_method", type=str, choices=['greedy', 'top_p', 'top_k', 'top_k_p', 'beam_search'], default='gpt2')
-  parser.add_argument("--skip_training", type=bool, default=False)
 
   args = parser.parse_args()
   return args
@@ -439,10 +355,6 @@ def add_arguments(args):
     args.d = 1280
     args.l = 36
     args.num_heads = 20
-  elif args.model_size == 'gpt2-xl':
-    args.d = 1600
-    args.l = 48
-    args.num_heads = 25
   else:
     raise Exception(f'{args.model_size} is not supported.')
   return args
@@ -452,7 +364,5 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  if not args.skip_training:
-    print("!!!!!!!!!!!!!!!!!!!!!!!! Start Training !!!!!!!!!!!!!!!!!!!!!!!!")
-    train(args)
+  train(args)
   generate_submission_sonnets(args)

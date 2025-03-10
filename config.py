@@ -226,5 +226,29 @@ class GPT2Config(PretrainedConfig):
     self.position_embedding_type = position_embedding_type
     self.use_cache = use_cache
 
+  def get(self, key, default=None):
+    return getattr(self, key, default)
 
+  # ✅ Convert to dict for compatibility
+  def to_dict(self):
+      return self.__dict__.copy()
 
+  # ✅ Make it iterable
+  def __iter__(self):
+      return iter(self.to_dict().items())
+
+  # ✅ Allow dictionary-style access
+  def __getitem__(self, key):
+      return getattr(self, key)
+
+  # ✅ Allow checking if key exists
+  def __contains__(self, key):
+      return key in self.__dict__
+
+  # ✅ Handle missing keys safely
+  def get(self, key, default=None):
+      return getattr(self, key, default)
+
+  # ✅ Pretty-print for debugging
+  def __repr__(self):
+      return f"GPT2Config({self.to_dict()})"

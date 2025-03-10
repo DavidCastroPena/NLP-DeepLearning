@@ -43,12 +43,13 @@ class GPT2Model(GPTPreTrainedModel):
 
     self.init_weights()
 
-  def embed(self, input_ids):
-      input_shape = input_ids.size()
-      seq_length = input_shape[1]
-
-      # Get token embeddings
-      inputs_embeds = self.word_embedding(input_ids)
+  def embed(self, input_ids, inputs_embeds=None):
+      if inputs_embeds is None:
+        input_shape = input_ids.size()
+        seq_length = input_shape[1]
+        inputs_embeds = self.word_embedding(input_ids)
+      else:
+        seq_length = inputs_embeds.size(1)
 
       # Get positional embeddings
       pos_ids = self.position_ids[:, :seq_length]
@@ -81,13 +82,13 @@ class GPT2Model(GPTPreTrainedModel):
 
     return hidden_states
 
-  def forward(self, input_ids, attention_mask):
+  def forward(self, input_ids, attention_mask, inputs_embeds=None, **kwargs):
     """
     input_ids: [batch_size, seq_len], seq_len is the max length of the batch
     attention_mask: same size as input_ids, 1 represents non-padding tokens, 0 represents padding tokens
     """
     # Get the embedding for each input token.
-    embedding_output = self.embed(input_ids=input_ids)
+    embedding_output = self.embed(input_ids=input_ids, inputs_embeds=inputs_embeds)
 
     # Feed to a transformer (a stack of GPTLayers).
     sequence_output = self.encode(embedding_output, attention_mask=attention_mask)
@@ -155,3 +156,68 @@ class GPT2Model(GPTPreTrainedModel):
     our_model.final_layer_norm.bias.data = gpt_model.state_dict()['ln_f.bias']
 
     return our_model
+
+class GPT2ModelWithLMHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.gpt2 = GPT2Model(config)  # Custom GPT-2 model
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)  # LM Head
+        self.config = config
+    
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        **kwargs
+    ):
+        outputs = self.gpt2(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,  # Always True to ensure output is a dict
+            **kwargs
+        )
+
+        logits = self.lm_head(outputs['last_hidden_state'])
+
+        if labels is not None:
+            # Calculate loss if labels provided
+            loss_fn = nn.CrossEntropyLoss()
+            # Shift logits and labels for causal LM loss calculation
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = loss_fn(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
+            return {"loss": loss, "logits": logits}
+
+        return {"logits": logits}
+
+    
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        """Make PEFT LoRA compatible for text generation."""
+        return {"input_ids": input_ids}
+    
+    @classmethod
+    def from_pretrained(cls, model='gpt2', d=768, l=12, num_heads=12):
+        """Load model with weights from pretrained OpenAI GPT-2."""
+        gpt_model = GPT2Model.from_pretrained(model=model, d=d, l=l, num_heads=num_heads)
+        config = GPT2Config(hidden_size=d, num_hidden_layers=l, num_attention_heads=num_heads, intermediate_size=d*3)
+
+        model_instance = cls(config)
+        model_instance.gpt2 = gpt_model  # Assign the loaded GPT2Model
+        model_instance.lm_head.weight = gpt_model.word_embedding.weight
+
+        return model_instance
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
