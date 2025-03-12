@@ -21,7 +21,7 @@ from transformers import GPT2Tokenizer
 from einops import rearrange
 
 from datasets import (
-  SonnetsDataset,
+  SonnetsDataset, PoetryDataset,
 )
 from models.gpt2 import GPT2Model
 
@@ -47,6 +47,13 @@ class SonnetGPT(nn.Module):
   def __init__(self, args):
     super().__init__()
     self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
+
+    # If additional pretraining was performed, load those weights.
+    if args.pretrain:
+      pretrained_state = torch.load(args.pretrain_filepath)
+      self.gpt.load_state_dict(pretrained_state)
+      print("Loaded additional pretrained GPT2Model weights.")
+
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -67,7 +74,6 @@ class SonnetGPT(nn.Module):
     hidden_states = outputs['last_hidden_state']
     logits = self.language_modeling_head(hidden_states)
     return logits
-
 
   def get_device(self):
     for param in self.gpt.parameters():
@@ -134,6 +140,52 @@ def save_model(model, optimizer, args, filepath):
   print(f"save the model to {filepath}")
 
 
+def pretrain_GPT2Model(args):
+    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+    # Load the poetry dataset (using your PoetryDataset class)
+    poetry_dataset = PoetryDataset(args.poetry_path)
+    pretrain_dataloader = DataLoader(poetry_dataset, shuffle=True, batch_size=args.batch_size,
+                                     collate_fn=poetry_dataset.collate_fn)
+    args = add_arguments(args)
+
+    # Initialize GPT2Model (our custom model) using the base configuration.
+    gpt2_model = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
+    gpt2_model = gpt2_model.to(device)
+
+    # Use AdamW (or your choice of optimizer) and the language modeling objective.
+    optimizer = AdamW(gpt2_model.parameters(), lr=args.lr)
+
+    # Pretraining loop
+    for epoch in range(args.pretrain_epochs):
+      gpt2_model.train()
+      total_loss = 0.0
+      num_batches = 0
+      for batch in tqdm(pretrain_dataloader, desc=f'Pretrain Epoch {epoch}', disable=TQDM_DISABLE):
+        b_ids, b_mask = batch['token_ids'], batch['attention_mask']
+        b_ids = b_ids.to(device)
+        b_mask = b_mask.to(device)
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = gpt2_model(b_ids, attention_mask=b_mask)
+        hidden_states = outputs['last_hidden_state']
+        logits = gpt2_model.hidden_state_to_token(hidden_states)
+        # Shift for language modeling: predict next token.
+        logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')
+        labels = b_ids[:, 1:].contiguous().flatten()
+        loss = F.cross_entropy(logits, labels, reduction='mean')
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+      print(f"Pretrain Epoch {epoch}: loss = {total_loss / num_batches:.3f}")
+
+    # Save the pretrained GPT2Model weights.
+    torch.save(gpt2_model.state_dict(), args.pretrain_filepath)
+    print(f"Pretrained GPT2Model saved to {args.pretrain_filepath}")
+
+
 def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
@@ -153,7 +205,7 @@ def train(args):
   optimizer = AdamW(model.parameters(), lr=lr)
 
   # Run for the specified number of epochs.
-  for epoch in range(args.epochs):
+  for epoch in range(args.finetune_epochs):
     model.train()
     train_loss = 0
     num_batches = 0
@@ -186,13 +238,13 @@ def train(args):
       print(f'{batch[1]}{output[1]}\n\n')
 
     # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
-    save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+  save_model(model, optimizer, args, f'{epoch}_{args.finetune_filepath}')
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  saved = torch.load(f'{args.finetune_epochs-1}_{args.finetune_filepath}', weights_only=False)
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -226,10 +278,13 @@ def get_args():
   parser.add_argument("--sonnet_path", type=str, default="data/sonnets.txt")
   parser.add_argument("--held_out_sonnet_path", type=str, default="data/sonnets_held_out.txt")
   parser.add_argument("--sonnet_out", type=str, default="predictions/generated_sonnets.txt")
+  parser.add_argument("--poetry_path", type=str, default="data/PoetryFoundationData.csv")
 
   parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, default=10)
+  parser.add_argument("--pretrain_epochs", type=int, default=10)
+  parser.add_argument("--finetune_epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
+  parser.add_argument("--pretrain", action='store_true', help="Perform additional pretraining on GPT2Model")
 
   # Generation parameters.
   parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
@@ -266,7 +321,10 @@ def add_arguments(args):
 
 if __name__ == "__main__":
   args = get_args()
-  args.filepath = f'predictions/{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
+  args.finetune_filepath = f'{args.finetune_epochs}-{args.lr}-sonnet.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
+  if args.pretrain:
+    args.pretrain_filepath = f'predictions/{args.pretrain_epochs}-{args.lr}-pretrain-sonnet.pt'  # Save path.
+    pretrain_GPT2Model(args)
   train(args)
   generate_submission_sonnets(args)
