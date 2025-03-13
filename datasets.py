@@ -161,3 +161,46 @@ class SonnetsDataset(Dataset):
     }
 
     return batched_data
+
+
+class PoetryDataset(Dataset):
+  def __init__(self, file_path):
+    self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    self.tokenizer.pad_token = self.tokenizer.eos_token
+    self.poems = self._load_poems(file_path)
+
+  def _load_poems(self, file_path):
+    """
+    Reads PoetryFoundationData.csv and extracts individual poems.
+    Assumes each row in the CSV has a poem in the first column.
+    """
+    # poems = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+      reader = csv.reader(f)
+      _ = next(reader)
+      poems = [row[2].replace('\n\n', '\n').strip() for row in reader]
+    return poems
+
+  def __len__(self):
+    return len(self.poems)
+
+  def __getitem__(self, idx):
+    return (idx, self.poems[idx])
+
+  def collate_fn(self, all_data):
+    """
+    Collates a batch of poems into token_ids and attention_mask suitable for GPT-2.
+    """
+    idx = [example[0] for example in all_data]
+    poems = [example[1] for example in all_data]
+
+    encoding = self.tokenizer(poems, return_tensors='pt', padding=True, truncation=True)
+    token_ids = encoding['input_ids'].long()
+    attention_mask = torch.LongTensor(encoding['attention_mask'])
+
+    batched_data = {
+      'token_ids': token_ids,
+      'attention_mask': attention_mask,
+      'sent_ids': idx
+    }
+    return batched_data
