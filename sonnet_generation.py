@@ -11,6 +11,9 @@ import argparse
 import random
 import torch
 
+import json
+import os
+
 import numpy as np
 import torch.nn.functional as F
 
@@ -32,16 +35,6 @@ from torch.utils.data import random_split
 
 # LoRA Configuration
 from peft import get_peft_model, LoraConfig, TaskType
-
-lora_config = LoraConfig(
-  task_type=TaskType.CAUSAL_LM,  # Language modeling task
-  r=16,  # rank (the more rank, the more information captured from original matrix)
-  lora_alpha=32,  # scaling (the larger the scale, the greater adaptation strength)
-  lora_dropout=0.1,  # Dropout for LoRA layers
-  target_modules = [f"gpt_layers.{i}.self_attention.query" for i in range(12)] + 
-                   [f"gpt_layers.{i}.self_attention.key" for i in range(12)] + 
-                   [f"gpt_layers.{i}.self_attention.value" for i in range(12)],
-)
 
 TQDM_DISABLE = False
 
@@ -75,15 +68,42 @@ class SonnetGPT(nn.Module):
     self.use_lora = args.use_lora
 
     if self.use_lora:
-      print("Use LORA!!!")
+      lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_rank,  # rank (the more rank, the more information captured from original matrix)
+        lora_alpha=32,  # scaling (the larger the scale, the greater adaptation strength)
+        lora_dropout=0.1,
+        target_modules = [f"gpt_layers.{i}.self_attention.query" for i in range(12)] + 
+                        [f"gpt_layers.{i}.self_attention.key" for i in range(12)] + 
+                        [f"gpt_layers.{i}.self_attention.value" for i in range(12)],
+      )
+      
       self.gpt = get_peft_model(self.gpt, lora_config)
       self.gpt.print_trainable_parameters()
 
     else:
       # self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
       # By default, fine-tune the full model. TODO: this is maybe not idea.
-      for param in self.gpt.parameters():
-        param.requires_grad = True
+      if args.freeze_half:
+        print("Freeze Half!!")
+        # Freeze all parameters first
+        for name, param in self.gpt.named_parameters():
+          param.requires_grad = False
+
+        # Get the number of transformer layers
+        num_layers = 12
+        for i in range(num_layers - num_layers, num_layers):
+            layer_name = f"gpt2.gpt_layers.{i}"
+            for name, param in self.gpt.named_parameters():
+                if name.startswith(layer_name):
+                    param.requires_grad = True
+                    print(f"✅ Unfreezing layer: {name}")
+      else:
+        for param in self.gpt.parameters():
+          param.requires_grad = True
+    
+    num_trainable_params = sum(p.numel() for p in self.gpt.parameters() if p.requires_grad)
+    print(f"Total Trainable Parameters: {num_trainable_params}")
     
   def forward(self, input_ids, attention_mask):
     """
@@ -103,7 +123,7 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, decoding_method="top_k_p", temperature=0.7, top_p=0.9, top_k=50, max_length=128, num_beams=5):
+  def generate(self, encoding, decoding_method="top_p", temperature=0.7, top_p=0.9, top_k=50, max_length=128, num_beams=5):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -254,6 +274,16 @@ def save_model(model, optimizer, args, filepath):
   torch.save(save_info, filepath)
   print(f"save the model to {filepath}")
 
+def save_training_stats(training_stats, args):
+  save_dir = "training_logs"
+  os.makedirs(save_dir, exist_ok=True)
+
+  save_path = os.path.join(save_dir, f"training_stats_{args.model_size}_epochs{args.epochs}.json")
+  with open(save_path, "w") as f:
+      json.dump(training_stats, f, indent=4)
+
+  print(f"Training stats saved at: {save_path}")
+
 @torch.no_grad()
 def evaluate_perplexity(model, dataloader, device):
     """Computes the perplexity of the model on the given dataloader."""
@@ -283,16 +313,6 @@ def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
 
-  # # Training + Validation data split.
-  # full_dataset = SonnetsDataset(args.sonnet_path)
-  # # Split into train and validation sets (80% train, 20% validation)
-  # train_size = int(0.8 * len(full_dataset))
-  # val_size = len(full_dataset) - train_size
-  # train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-
-  # train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size, collate_fn=full_dataset.collate_fn)
-  # val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=full_dataset.collate_fn)
-
   sonnet_dataset = SonnetsDataset(args.sonnet_path)
   sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
                                  collate_fn=sonnet_dataset.collate_fn)
@@ -312,6 +332,12 @@ def train(args):
   epochs_no_improve = 0
 
   # Run for the specified number of epochs.
+  training_stats = {
+      "args": vars(args),  # Store args as a dictionary
+      "losses": [],
+      "perplexities": []
+  }
+  
   for epoch in range(args.epochs):
 
     print("GPU allocated memory:", torch.cuda.memory_allocated() / 1e9, "GB")
@@ -337,18 +363,12 @@ def train(args):
       train_loss += loss.item()
       num_batches += 1
 
-    train_loss = train_loss / num_batches
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
+    avg_loss = train_loss / num_batches
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    print(f"Epoch {epoch}: train loss :: {avg_loss :.3f}, perplexity :: {perplexity :.3f}.")
 
-    # val_loss, perplexity = evaluate_perplexity(model, val_dataloader, device)
-    # print(f"Epoch {epoch}: validation loss :: {val_loss :.3f}, perplexity :: {perplexity :.3f}.")
-
-    # print('Generating several output sonnets...')
-    # model.eval()
-    # for batch in held_out_sonnet_dataset:
-    #   encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
-    #   output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
-    #   print(f'{batch[1]}{output[1]}\n\n')
+    training_stats["losses"].append(avg_loss)
+    training_stats["perplexities"].append(perplexity)
 
     # Early stopping to prevent overfitting on the small dataset of sonnets.
     if train_loss < best_loss:
@@ -363,6 +383,7 @@ def train(args):
     
     # save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
   save_model(model, optimizer, args, f'final_{args.filepath}')
+  save_training_stats(training_stats, args)
 
 
 @torch.no_grad()
@@ -418,7 +439,9 @@ def get_args():
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
   
   parser.add_argument("--use_lora", type=bool, default=False)
-  parser.add_argument("--decoding_method", type=str, choices=['greedy', 'top_p', 'top_k', 'top_k_p', 'beam_search'], default='gpt2')
+  parser.add_argument("--freeze_half", type=bool, default=False)
+  parser.add_argument("--lora_rank", type=int, default=8)
+  parser.add_argument("--decoding_method", type=str, choices=['greedy', 'top_p', 'top_k', 'top_k_p', 'beam_search'], default='top_p')
   parser.add_argument("--skip_training", type=bool, default=False)
 
   args = parser.parse_args()

@@ -19,6 +19,9 @@ import torch.nn as nn
 from torch import Tensor
 import fnmatch
 
+import matplotlib.pyplot as plt
+import numpy as np
+
 __version__ = "4.0.0"
 _torch_version = importlib_metadata.version("torch")
 
