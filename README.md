@@ -1,4 +1,4 @@
-# Project Overview
+# Improving GPT-2 Task-Specific Performance via Impossible Distillation, Sparse Attention, and Parameter-Efficient Fine-Tuning
 
 In this project, we reproduced the Generative Pre-trained Transformer 2 (GPT-2) model and fine-tuned it for various downstream tasks, introducing task-specific improvements to both the model architecture and fine-tuning techniques. We implemented GPT-2 from scratch, loaded pretrained weights from Hugging Face, and fine-tuned the model for sentiment analysis, paraphrase detection, and sonnet generation.
 
